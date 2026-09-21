@@ -33,6 +33,10 @@ ProgressHandler = Callable[[ProgressInfo], None]
 """A callable invoked with a :class:`ProgressInfo` on every progress event."""
 
 
+class _TransportError(Exception):
+    """An I/O failure raised while receiving from the WebSocket."""
+
+
 @dataclass
 class Query:
     sql: str
@@ -137,9 +141,11 @@ class Connection:
             except websockets.exceptions.ConnectionClosed:
                 logging.info("Connection closed; stopping main loop.")
                 return
+            except _TransportError:
+                logging.exception("SQL session transport failed; stopping main loop")
+                return
             except Exception as e:
                 logging.exception("Error handling message from SQL session", exc_info=e)
-                return
 
     def __connection_error(
         self, execution_id: str, details: str | None = None
@@ -170,7 +176,8 @@ class Connection:
             def lookup() -> None:
                 try:
                     result_queue.put(self.__failure_details())
-                except Exception:
+                except Exception as e:
+                    logging.debug("Failure-details lookup failed: %s", e)
                     result_queue.put(None)
 
             try:
@@ -178,10 +185,12 @@ class Connection:
                     target=lookup, daemon=True, name="wherobots-failure-details"
                 ).start()
                 details = result_queue.get(timeout=2.0)
-            except (queue.Empty, RuntimeError):
+            except queue.Empty:
                 # Enrichment must not prevent failure delivery, even if the
                 # process cannot start another thread.
                 pass
+            except RuntimeError as e:
+                logging.debug("Could not start failure-details lookup: %s", e)
         for query in pending:
             try:
                 query.handler(
@@ -359,7 +368,12 @@ class Connection:
         return json.dumps(message)
 
     def __recv(self) -> Dict[str, Any]:
-        frame = self.__ws.recv(timeout=self.__read_timeout)
+        try:
+            frame = self.__ws.recv(timeout=self.__read_timeout)
+        except OSError as e:
+            # Distinguish transport I/O failures from OSErrors raised later by
+            # protocol parsing or result decoding; only the former are terminal.
+            raise _TransportError from e
         if isinstance(frame, str):
             message = json.loads(frame)
         elif isinstance(frame, bytes):
@@ -388,6 +402,15 @@ class Connection:
         if store:
             request["store"] = store.to_dict()
 
+        # Redact literal values before logging: this driver is embedded by other
+        # services, so raw SQL here would leak into their log streams (WBC-139).
+        logging.info(
+            "Executing SQL query %s (%s): %s",
+            execution_id,
+            get_statement_type(sql),
+            textwrap.shorten(redact_sql(sql), width=200),
+        )
+        send_failed = False
         with self.__lock:
             if self.__closed:
                 raise self.__connection_error(execution_id)
@@ -398,18 +421,14 @@ class Connection:
                 handler=handler,
                 store=store,
             )
-
-        # Redact literal values before logging: this driver is embedded by other
-        # services, so raw SQL here would leak into their log streams (WBC-139).
-        logging.info(
-            "Executing SQL query %s (%s): %s",
-            execution_id,
-            get_statement_type(sql),
-            textwrap.shorten(redact_sql(sql), width=200),
-        )
-        try:
-            self.__send(request)
-        except Exception:
+            try:
+                # Keep registration and transmission atomic with respect to
+                # shutdown: close() must not claim this query before its SQL is
+                # sent, then report failure while the request is still emitted.
+                self.__send(request)
+            except Exception:
+                send_failed = True
+        if send_failed:
             self.__fail_pending()
         return execution_id
 
