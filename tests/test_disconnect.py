@@ -3,6 +3,9 @@ import errno
 import json
 import queue
 import socket
+import ssl
+import subprocess
+import shutil
 import threading
 import time
 from unittest.mock import MagicMock, patch
@@ -18,7 +21,7 @@ from websockets.uri import parse_uri
 from wherobots.db._transport import abort_connection
 from wherobots.db.connection import Connection, Query
 from wherobots.db.driver import connect_direct
-from wherobots.db.errors import OperationalError
+from wherobots.db.errors import OperationalError, ProgrammingError
 from wherobots.db.types import ExecutionState
 
 
@@ -209,6 +212,23 @@ def test_serialization_error_does_not_register_or_fail_other_queries():
     conn.close()
 
 
+def test_rejected_reexecution_does_not_leave_a_stale_execution_id():
+    ws = Transport()
+    conn = Connection(ws)
+    cursor = conn.cursor()
+    cursor.execute("SELECT 1")
+    deliver(ws, ws.sent[0]["execution_id"])
+    # Consume the terminal outcome without depending on empty-result slicing.
+    assert cursor._Cursor__get_results() is None
+    store = MagicMock()
+    store.to_dict.return_value = {"invalid": object()}
+    with pytest.raises(TypeError):
+        cursor.execute("SELECT 2", store=store)
+    with pytest.raises(ProgrammingError, match="No query"):
+        cursor.fetchall()
+    conn.close()
+
+
 def test_nontransport_send_error_is_propagated_and_query_is_untracked():
     ws = Transport()
     conn = Connection(ws)
@@ -365,10 +385,56 @@ def test_failure_is_not_delivered_before_transport_is_disabled():
         closer.join(timeout=3)
 
 
-def test_real_websocket_stalled_send_is_interrupted_by_close():
+@pytest.mark.parametrize("tls", [False, True])
+def test_real_websocket_stalled_send_is_interrupted_by_close(tls, tmp_path):
     # Real library protocol mutex + socket.sendall; the peer never reads.
     local, peer = socket.socketpair()
     local.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
+    if tls:
+        openssl = shutil.which("openssl")
+        if openssl is None:
+            local.close()
+            peer.close()
+            pytest.skip("TLS fixture requires openssl")
+        key, cert = tmp_path / "key.pem", tmp_path / "cert.pem"
+        subprocess.run(
+            [
+                openssl,
+                "req",
+                "-x509",
+                "-newkey",
+                "rsa:2048",
+                "-nodes",
+                "-keyout",
+                str(key),
+                "-out",
+                str(cert),
+                "-days",
+                "1",
+                "-subj",
+                "/CN=localhost",
+            ],
+            check=True,
+            capture_output=True,
+        )
+        server_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        server_context.load_cert_chain(cert, key)
+        client_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        client_context.check_hostname = False
+        client_context.verify_mode = (
+            ssl.CERT_NONE
+        )  # Local generated test certificate only.
+        peers = queue.Queue()
+        server_socket = peer
+        handshake = threading.Thread(
+            target=lambda: peers.put(
+                server_context.wrap_socket(server_socket, server_side=True)
+            )
+        )
+        handshake.start()
+        local = client_context.wrap_socket(local, server_hostname="localhost")
+        peer = peers.get(timeout=3)
+        handshake.join(timeout=3)
     protocol = ClientProtocol(parse_uri("ws://localhost"), state=State.OPEN)
     ws = ClientConnection(local, protocol)
     conn = Connection(ws)
