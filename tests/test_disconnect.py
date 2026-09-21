@@ -11,6 +11,7 @@ import time
 from unittest.mock import MagicMock, patch
 
 import pandas
+import cbor2
 import pytest
 from websockets.exceptions import ConnectionClosedError, ConnectionClosedOK
 from websockets.protocol import State
@@ -43,6 +44,8 @@ class Transport:
             if not isinstance(value, TimeoutError):
                 self.protocol.state = State.CLOSED
             raise value
+        if isinstance(value, bytes):
+            return value
         return json.dumps(value)
 
     def send(self, value):
@@ -172,11 +175,17 @@ def test_buffered_result_is_drained_even_when_transport_is_already_closed():
 
 
 @pytest.mark.parametrize(
-    "decode_error", [ValueError("bad payload"), OSError("decoder error")]
+    "decode_error",
+    [
+        ValueError("private payload"),
+        OSError("private payload"),
+        TimeoutError("private payload"),
+        ConnectionClosedError(None, None),
+    ],
 )
-def test_result_decode_error_does_not_fail_other_queries(decode_error):
+def test_result_decode_error_completes_only_affected_query(decode_error, caplog):
     ws = Transport()
-    conn = Connection(ws)
+    conn = Connection(ws, session_id="session-1")
     bad = conn.cursor()
     good = conn.cursor()
     bad.execute("SELECT bad")
@@ -192,8 +201,113 @@ def test_result_decode_error_does_not_fail_other_queries(decode_error):
         )
         deliver(ws, ws.sent[1]["execution_id"])
         assert good._Cursor__queue.get(timeout=3).error is None
+        outcome = bad._Cursor__queue.get(timeout=3)
+    assert isinstance(outcome.error, OperationalError)
+    assert "Could not decode" in str(outcome.error)
+    assert "session-1" in str(outcome.error)
+    assert ws.sent[0]["execution_id"] in str(outcome.error)
+    assert "private payload" not in str(outcome.error) + caplog.text
+    assert "connection lost" not in str(outcome.error)
+    assert not conn._Connection__queries
+    bad._Cursor__queue.put(outcome)
+    for fetch in (bad.fetchall, bad.fetchall, bad.get_store_result):
+        with pytest.raises(OperationalError) as exc:
+            fetch()
+        assert exc.value is outcome.error
+    assert not conn._Connection__closed
+    good.execute("SELECT next")
+    deliver(ws, ws.sent[-1]["execution_id"])
+    assert good._Cursor__queue.get(timeout=3).error is None
+    conn.close()
+    assert bad._Cursor__queue.empty()
+
+
+@pytest.mark.parametrize(
+    "results",
+    [
+        {"format": "json", "result_bytes": b"private malformed JSON"},
+        {"format": "arrow", "result_bytes": b"private malformed Arrow"},
+        {"format": "unsupported", "result_bytes": b"private"},
+        {"format": "arrow"},
+        ["private malformed object"],
+        "",
+        False,
+    ],
+)
+def test_malformed_result_payload_delivers_one_error(results, caplog):
+    ws = Transport()
+    conn = Connection(ws)
+    cursor = conn.cursor()
+    cursor.execute("SELECT 1")
+    message = cbor2.dumps(
+        {
+            "kind": "execution_result",
+            "execution_id": ws.sent[0]["execution_id"],
+            "state": "succeeded",
+            "results": results,
+        }
+    )
+    ws.incoming.put(message)
+    outcome = cursor._Cursor__queue.get(timeout=3)
+    assert isinstance(outcome.error, OperationalError)
+    assert "Could not decode" in str(outcome.error)
+    assert "private" not in str(outcome.error) + caplog.text
+    assert not conn._Connection__queries
+    # Duplicate server messages and later shutdown cannot deliver again.
+    ws.incoming.put(message)
     assert not conn._Connection__closed
     conn.close()
+    assert cursor._Cursor__queue.empty()
+
+
+@pytest.mark.parametrize("state", [None, "unknown", 123, {}])
+def test_invalid_state_completes_only_identified_query(state):
+    ws = Transport()
+    conn = Connection(ws)
+    bad, good = conn.cursor(), conn.cursor()
+    bad.execute("SELECT bad")
+    good.execute("SELECT good")
+    ws.incoming.put(
+        {
+            "kind": "execution_result",
+            "execution_id": ws.sent[0]["execution_id"],
+            "state": state,
+        }
+    )
+    outcome = bad._Cursor__queue.get(timeout=3)
+    assert isinstance(outcome.error, OperationalError)
+    assert "Could not interpret" in str(outcome.error)
+    assert ws.sent[0]["execution_id"] not in conn._Connection__queries
+    deliver(ws, ws.sent[1]["execution_id"])
+    assert good._Cursor__queue.get(timeout=3).error is None
+    assert not conn._Connection__closed
+    conn.close()
+
+
+def test_local_retrieve_send_error_completes_only_affected_query():
+    ws = Transport()
+    conn = Connection(ws)
+    bad, good = conn.cursor(), conn.cursor()
+    bad.execute("SELECT bad")
+    good.execute("SELECT good")
+    with patch.object(ws, "send", side_effect=ValueError("private API error")):
+        ws.incoming.put(
+            {
+                "kind": "state_updated",
+                "execution_id": ws.sent[0]["execution_id"],
+                "state": "succeeded",
+            }
+        )
+        outcome = bad._Cursor__queue.get(timeout=3)
+    assert isinstance(outcome.error, OperationalError)
+    assert "Could not request" in str(outcome.error)
+    assert "private" not in str(outcome.error)
+    assert ws.sent[0]["execution_id"] not in conn._Connection__queries
+    deliver(ws, ws.sent[1]["execution_id"])
+    assert good._Cursor__queue.get(timeout=3).error is None
+    assert not conn._Connection__closed
+    conn.close()
+    assert bad._Cursor__queue.empty()
 
 
 def test_serialization_error_does_not_register_or_fail_other_queries():
@@ -295,7 +409,8 @@ def test_close_from_reader_callback_does_not_join_itself():
     assert not conn._Connection__thread.is_alive()
 
 
-def test_close_racing_result_decode_delivers_only_one_terminal_outcome():
+@pytest.mark.parametrize("decode_fails", [False, True])
+def test_close_racing_result_decode_delivers_only_one_terminal_outcome(decode_fails):
     decoding = threading.Event()
     release = threading.Event()
     ws = Transport()
@@ -306,6 +421,8 @@ def test_close_racing_result_decode_delivers_only_one_terminal_outcome():
     def decode(*args):
         decoding.set()
         assert release.wait(timeout=5)
+        if decode_fails:
+            raise ValueError("private payload")
         return pandas.DataFrame({"x": [1]})
 
     with patch.object(conn, "_handle_results", side_effect=decode):

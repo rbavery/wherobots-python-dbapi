@@ -249,13 +249,27 @@ class Connection:
             if claimed is not None:
                 claimed.handler(result)
 
+        def fail_query(action: str, error: Exception) -> None:
+            # This is a query-local failure, not evidence of transport loss.
+            # Exception text may contain result data; report only its type.
+            query.state = ExecutionState.FAILED
+            message = (
+                f"Could not {action} SQL results "
+                f"(session={self.__session_id or 'unknown'}, "
+                f"execution={execution_id}; {type(error).__name__}). "
+                "The statement may have completed; verify the operation before "
+                "retrying writes."
+            )
+            logging.error("%s", message)
+            complete_query(ExecutionResult(error=OperationalError(message)))
+
         # Incoming state transitions are handled here.
         if kind == EventKind.STATE_UPDATED or kind == EventKind.EXECUTION_RESULT:
             try:
                 query.state = ExecutionState[message["state"].upper()]
                 logging.info("Query %s is now %s.", execution_id, query.state)
-            except KeyError:
-                logging.warning("Invalid state update message for %s", execution_id)
+            except (KeyError, AttributeError, TypeError) as error:
+                fail_query("interpret", error)
                 return
 
             if query.state == ExecutionState.SUCCEEDED:
@@ -290,21 +304,34 @@ class Connection:
                         return
 
                     # No store configured, request results normally
-                    self.__request_results(execution_id)
+                    try:
+                        self.__request_results(execution_id)
+                    except Exception as error:
+                        # Transport failures are handled by __send; a local
+                        # retrieval failure must not orphan this execution.
+                        fail_query("request", error)
                     return
 
                 # Otherwise, process the results from the execution_result event.
                 results = message.get("results")
-                if not results or not isinstance(results, dict):
+                if results is None or results == {}:
                     logging.warning("Got no results back from %s.", execution_id)
                     query.state = ExecutionState.COMPLETED
                     complete_query(ExecutionResult())
                     return
 
-                query.state = ExecutionState.COMPLETED
-                complete_query(
-                    ExecutionResult(results=self._handle_results(execution_id, results))
-                )
+                try:
+                    if not isinstance(results, dict):
+                        raise TypeError("Expected a result object")
+                    decoded = self._handle_results(execution_id, results)
+                except Exception as error:
+                    # Even OSError/TimeoutError here belong to decoding, not
+                    # recv. Claim and deliver exactly once, including if close
+                    # concurrently claims this execution.
+                    fail_query("decode", error)
+                else:
+                    query.state = ExecutionState.COMPLETED
+                    complete_query(ExecutionResult(results=decoded))
             elif query.state == ExecutionState.CANCELLED:
                 logging.info(
                     "Query %s has been cancelled; returning empty results.",
@@ -342,7 +369,7 @@ class Connection:
             with pyarrow.ipc.open_stream(stream) as reader:
                 return reader.read_pandas()
         else:
-            return OperationalError(f"Unsupported results format {result_format}")
+            raise NotSupportedError("Unsupported results format")
 
     def __send(self, message: Dict[str, Any], query: Query | None = None) -> None:
         # Serialization and redaction are local work. Fail before registration,
