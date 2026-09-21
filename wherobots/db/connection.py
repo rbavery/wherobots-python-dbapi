@@ -1,8 +1,8 @@
 import json
 import logging
-import queue
 import textwrap
 import threading
+import time
 import uuid
 from dataclasses import dataclass
 from typing import Any, Callable, Dict
@@ -16,6 +16,7 @@ import websockets.exceptions
 import websockets.sync.client
 
 from .constants import DEFAULT_READ_TIMEOUT_SECONDS
+from ._transport import abort_connection
 from .cursor import Cursor
 from .errors import NotSupportedError, OperationalError
 from .models import ExecutionResult, ProgressInfo, Store, StoreResult
@@ -69,7 +70,6 @@ class Connection:
         data_compression: DataCompression | None = None,
         geometry_representation: GeometryRepresentation | None = None,
         session_id: str | None = None,
-        failure_details: Callable[[], str | None] | None = None,
     ):
         self.__ws = ws
         self.__read_timeout = read_timeout
@@ -79,8 +79,10 @@ class Connection:
         self.__progress_handler: ProgressHandler | None = None
 
         self.__session_id = session_id
-        self.__failure_details = failure_details
         self.__lock = threading.Lock()
+        self.__send_lock = threading.Lock()
+        self.__shutdown_done = threading.Event()
+        self.__shutdown_owner: int | None = None
         self.__closed = False
         self.__queries: dict[str, Query] = {}
         self.__thread = threading.Thread(
@@ -95,8 +97,19 @@ class Connection:
         self.close()
 
     def close(self) -> None:
-        self.__fail_pending(enrich=False)
-        self.__ws.close()
+        """Abort the transport, fail pending work, and wait up to 1s for the reader.
+
+        Closing doesn't imply that server-side writes were rolled back. A
+        decoder or callback can outlive the bounded reader join.
+        """
+        deadline = time.monotonic() + 1.0
+        self.__fail_pending()
+        # A handler may close its own connection during terminal delivery.
+        if self.__shutdown_owner == threading.get_ident():
+            return
+        self.__shutdown_done.wait(max(0.0, deadline - time.monotonic()))
+        if self.__thread is not threading.current_thread():
+            self.__thread.join(timeout=max(0.0, deadline - time.monotonic()))
 
     def commit(self) -> None:
         raise NotSupportedError
@@ -133,6 +146,8 @@ class Connection:
     def __receive_loop(self) -> None:
         # recv drains buffered results before raising ConnectionClosed.
         while True:
+            if self.__shutdown_done.is_set():
+                return
             try:
                 self.__listen()
             except TimeoutError:
@@ -147,61 +162,45 @@ class Connection:
             except Exception as e:
                 logging.exception("Error handling message from SQL session", exc_info=e)
 
-    def __connection_error(
-        self, execution_id: str, details: str | None = None
-    ) -> OperationalError:
+    def __connection_error(self, execution_id: str) -> OperationalError:
         message = (
             f"SQL connection lost (session={self.__session_id or 'unknown'}, "
             f"execution={execution_id}). Commit outcome is unknown; "
             "verify the operation before retrying writes."
         )
-        if details:
-            message += f" Session failure: {details}"
         return OperationalError(message)
 
-    def __fail_pending(self, enrich: bool = True) -> None:
-        # Claim terminal delivery atomically with query registration/result delivery.
+    def __fail_pending(self) -> None:
+        # Stop admission first. Do not wait for __send_lock: its owner may be
+        # blocked in network I/O. __closed means closing until shutdown_done.
         with self.__lock:
             if self.__closed:
                 return
             self.__closed = True
+            self.__shutdown_owner = threading.get_ident()
+        try:
+            abort_connection(self.__ws)
+        except OSError:
+            # The adapter still closes the socket object in its finally block.
+            logging.exception("Socket shutdown failed; socket was closed")
+        with self.__lock:
             pending = list(self.__queries.values())
             self.__queries.clear()
-        details = None
-        if pending and enrich and self.__failure_details is not None:
-            # requests' socket timeouts don't bound DNS or a trickling response.
-            # One daemon lookup per connection bounds the callers' total wait too.
-            result_queue: queue.Queue = queue.Queue(maxsize=1)
-
-            def lookup() -> None:
+        try:
+            for query in pending:
                 try:
-                    result_queue.put(self.__failure_details())
-                except Exception as e:
-                    logging.debug("Failure-details lookup failed: %s", e)
-                    result_queue.put(None)
-
-            try:
-                threading.Thread(
-                    target=lookup, daemon=True, name="wherobots-failure-details"
-                ).start()
-                details = result_queue.get(timeout=2.0)
-            except queue.Empty:
-                # Enrichment must not prevent failure delivery, even if the
-                # process cannot start another thread.
-                pass
-            except RuntimeError as e:
-                logging.debug("Could not start failure-details lookup: %s", e)
-        for query in pending:
-            try:
-                query.handler(
-                    ExecutionResult(
-                        error=self.__connection_error(query.execution_id, details)
+                    query.handler(
+                        ExecutionResult(
+                            error=self.__connection_error(query.execution_id)
+                        )
                     )
-                )
-            except Exception:
-                logging.exception(
-                    "Could not deliver connection failure to query handler"
-                )
+                except Exception:
+                    logging.exception(
+                        "Could not deliver connection failure to query handler"
+                    )
+        finally:
+            self.__shutdown_owner = None
+            self.__shutdown_done.set()
 
     def __listen(self) -> None:
         """Waits for the next message from the SQL session and processes it.
@@ -345,14 +344,38 @@ class Connection:
         else:
             return OperationalError(f"Unsupported results format {result_format}")
 
-    def __send(self, message: Dict[str, Any]) -> None:
+    def __send(self, message: Dict[str, Any], query: Query | None = None) -> None:
+        # Serialization and redaction are local work. Fail before registration,
+        # without poisoning unrelated cursors or misreporting a transport loss.
         request = json.dumps(message)
         # Only compute the redacted request (json.dumps + sqlparse parse) when
         # DEBUG is actually enabled; the log argument is evaluated eagerly, so an
         # unguarded call would redact on every request even with DEBUG off.
         if logging.getLogger().isEnabledFor(logging.DEBUG):
             logging.debug("Request: %s", self.__redacted_request(message))
-        self.__ws.send(request)
+        with self.__send_lock:
+            with self.__lock:
+                if self.__closed:
+                    if query is not None:
+                        raise self.__connection_error(query.execution_id)
+                    return
+                if query is not None:
+                    self.__queries[query.execution_id] = query
+                elif message.get("execution_id") not in self.__queries:
+                    return
+            try:
+                self.__ws.send(request)
+            except (websockets.exceptions.ConnectionClosed, OSError):
+                pass  # Terminate outside the send gate, before delivering errors.
+            except Exception:
+                # API/programming errors aren't evidence of connection loss.
+                if query is not None:
+                    with self.__lock:
+                        self.__queries.pop(query.execution_id, None)
+                raise
+            else:
+                return
+        self.__fail_pending()
 
     @staticmethod
     def __redacted_request(message: Dict[str, Any]) -> str:
@@ -370,6 +393,8 @@ class Connection:
     def __recv(self) -> Dict[str, Any]:
         try:
             frame = self.__ws.recv(timeout=self.__read_timeout)
+        except TimeoutError:
+            raise  # Idle polls are expected, not terminal I/O failures.
         except OSError as e:
             # Distinguish transport I/O failures from OSErrors raised later by
             # protocol parsing or result decoding; only the former are terminal.
@@ -410,26 +435,16 @@ class Connection:
             get_statement_type(sql),
             textwrap.shorten(redact_sql(sql), width=200),
         )
-        send_failed = False
-        with self.__lock:
-            if self.__closed:
-                raise self.__connection_error(execution_id)
-            self.__queries[execution_id] = Query(
+        self.__send(
+            request,
+            Query(
                 sql=sql,
                 execution_id=execution_id,
                 state=ExecutionState.EXECUTION_REQUESTED,
                 handler=handler,
                 store=store,
-            )
-            try:
-                # Keep registration and transmission atomic with respect to
-                # shutdown: close() must not claim this query before its SQL is
-                # sent, then report failure while the request is still emitted.
-                self.__send(request)
-            except Exception:
-                send_failed = True
-        if send_failed:
-            self.__fail_pending()
+            ),
+        )
         return execution_id
 
     def __request_results(self, execution_id: str) -> None:

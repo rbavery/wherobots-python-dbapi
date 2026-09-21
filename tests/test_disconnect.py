@@ -1,6 +1,8 @@
-"""Connection loss must complete each pending cursor exactly once."""
+"""Transport loss must complete pending queries without waiting for a sender."""
+import errno
 import json
 import queue
+import socket
 import threading
 import time
 from unittest.mock import MagicMock, patch
@@ -9,10 +11,15 @@ import pandas
 import pytest
 from websockets.exceptions import ConnectionClosedError, ConnectionClosedOK
 from websockets.protocol import State
+from websockets.sync.client import ClientConnection
+from websockets.client import ClientProtocol
+from websockets.uri import parse_uri
 
-from wherobots.db.connection import Connection
+from wherobots.db._transport import abort_connection
+from wherobots.db.connection import Connection, Query
 from wherobots.db.driver import connect_direct
 from wherobots.db.errors import OperationalError
+from wherobots.db.types import ExecutionState
 
 
 class Transport:
@@ -20,19 +27,41 @@ class Transport:
         self.protocol = MagicMock(state=State.OPEN)
         self.incoming = queue.Queue()
         self.sent = []
+        self.aborted = threading.Event()
+        self.socket = MagicMock()
+        self.socket.shutdown.side_effect = self.shutdown
 
     def recv(self, timeout):
-        value = self.incoming.get(timeout=3)
+        try:
+            value = self.incoming.get(timeout=timeout)
+        except queue.Empty:
+            raise TimeoutError from None
         if isinstance(value, Exception):
-            self.protocol.state = State.CLOSED
+            if not isinstance(value, TimeoutError):
+                self.protocol.state = State.CLOSED
             raise value
         return json.dumps(value)
 
     def send(self, value):
+        if self.aborted.is_set():
+            raise ConnectionClosedError(None, None)
         self.sent.append(json.loads(value))
 
-    def close(self):
+    def shutdown(self, how):
+        assert how == socket.SHUT_RDWR
+        self.aborted.set()
         self.incoming.put(ConnectionClosedOK(None, None))
+
+
+def deliver(ws, execution_id):
+    ws.incoming.put(
+        {
+            "kind": "execution_result",
+            "execution_id": execution_id,
+            "state": "succeeded",
+            "results": None,
+        }
+    )
 
 
 @pytest.mark.parametrize(
@@ -61,10 +90,29 @@ def test_disconnect_unblocks_all_cursors_and_rejects_new_queries(error):
         assert "private" not in str(exc.value)
         with pytest.raises(OperationalError):
             cursor.fetchall()
+        assert cursor._Cursor__queue.empty()
     assert not conn._Connection__queries
     with pytest.raises(OperationalError):
         conn.cursor().execute("INSERT INTO t VALUES (1)")
     assert len(ws.sent) == 3
+    assert ws.aborted.is_set()
+
+
+def test_idle_timeouts_then_result_leave_connection_usable():
+    ws = Transport()
+    conn = Connection(ws)
+    cursor = conn.cursor()
+    cursor.execute("SELECT 1")
+    ws.incoming.put(TimeoutError())
+    ws.incoming.put(TimeoutError())
+    deliver(ws, ws.sent[0]["execution_id"])
+    assert cursor._Cursor__queue.get(timeout=3).error is None
+    assert conn._Connection__thread.is_alive()
+    assert not conn._Connection__closed
+    conn.cursor().execute("SELECT 2")
+    assert len(ws.sent) == 2
+    conn.close()
+    assert not conn._Connection__thread.is_alive()
 
 
 def test_delivered_result_wins_close_and_is_not_overwritten():
@@ -72,109 +120,39 @@ def test_delivered_result_wins_close_and_is_not_overwritten():
     conn = Connection(ws)
     cursor = conn.cursor()
     cursor.execute("SELECT 1")
-    with patch.object(
-        conn, "_handle_results", return_value=pandas.DataFrame({"x": [1]})
-    ):
-        ws.incoming.put(
-            {
-                "kind": "execution_result",
-                "execution_id": ws.sent[0]["execution_id"],
-                "state": "succeeded",
-                "results": {"ignored": True},
-            }
-        )
-        ws.incoming.put(ConnectionClosedOK(None, None))
-        conn._Connection__thread.join(timeout=3)
-    assert cursor.fetchall()["x"].tolist() == [1]
+    deliver(ws, ws.sent[0]["execution_id"])
+    ws.incoming.put(ConnectionClosedOK(None, None))
+    conn._Connection__thread.join(timeout=3)
+    assert cursor._Cursor__queue.get(timeout=1).error is None
     assert cursor._Cursor__queue.empty()
 
 
-def test_close_fails_pending_without_waiting_for_status():
+def test_close_fails_pending_and_joins_reader():
     ws = Transport()
-    details = MagicMock()
-    conn = Connection(ws, failure_details=details)
+    conn = Connection(ws)
     cursor = conn.cursor()
     cursor.execute("SELECT 1")
     conn.close()
     with pytest.raises(OperationalError):
         cursor.fetchall()
-    details.assert_not_called()
-    conn._Connection__thread.join(timeout=3)
-
-
-def test_stalled_enrichment_is_bounded_once_for_all_cursors():
-    release = threading.Event()
-    ws = Transport()
-
-    def lookup():
-        release.wait(timeout=10)
-        return "late"
-
-    conn = Connection(ws, failure_details=lookup)
-    cursors = [conn.cursor() for _ in range(3)]
-    for cursor in cursors:
-        cursor.execute("SELECT 1")
-    started = time.monotonic()
-    ws.incoming.put(ConnectionClosedError(None, None))
-    conn._Connection__thread.join(timeout=3)
-    try:
-        assert not conn._Connection__thread.is_alive()
-        assert time.monotonic() - started < 3
-        for cursor in cursors:
-            with pytest.raises(OperationalError, match="Commit outcome is unknown"):
-                cursor.fetchall()
-    finally:
-        release.set()
+    assert not conn._Connection__thread.is_alive()
+    conn.close()
+    ws.socket.shutdown.assert_called_once()
 
 
 @pytest.mark.parametrize(
-    "status,payload",
-    [
-        (200, {"firstFailure": {"message": "Evicted: ephemeral-storage"}}),
-        (404, {}),
-        (503, {}),
-        (200, {}),
-        (200, None),
-    ],
+    "error", [ConnectionClosedError(None, None), OSError("send failed")]
 )
-def test_http_enrichment_best_effort(status, payload):
-    ws = Transport()
-    response = MagicMock(status_code=status)
-    response.json.return_value = payload
-    response.__enter__.return_value = response
-    with patch(
-        "wherobots.db.driver.websockets.sync.client.connect", return_value=ws
-    ), patch("wherobots.db.driver.requests.get", return_value=response) as get:
-        conn = connect_direct(
-            "wss://compute/sql",
-            headers={"Authorization": "Bearer test"},
-            session_status_url="https://api/sql/session/session-1",
-        )
-        cursor = conn.cursor()
-        cursor.execute("SELECT 1")
-        ws.incoming.put(ConnectionClosedError(None, None))
-        conn._Connection__thread.join(timeout=3)
-        assert not conn._Connection__thread.is_alive()
-        with pytest.raises(OperationalError) as exc:
-            cursor.fetchall()
-        assert ("ephemeral-storage" in str(exc.value)) == (
-            status == 200 and bool(payload)
-        )
-        assert get.call_args.kwargs["timeout"] == 1.0
-        assert get.call_args.kwargs["allow_redirects"] is False
-
-
-def test_send_failure_does_not_leave_pending_query():
+def test_send_failure_does_not_leave_pending_query(error):
     ws = Transport()
     conn = Connection(ws)
-    ws.send = MagicMock(side_effect=ConnectionClosedError(None, None))
+    ws.send = MagicMock(side_effect=error)
     cursor = conn.cursor()
     cursor.execute("INSERT INTO t VALUES (1)")
     with pytest.raises(OperationalError):
         cursor.fetchall()
     assert not conn._Connection__queries
     conn.close()
-    conn._Connection__thread.join(timeout=3)
 
 
 def test_buffered_result_is_drained_even_when_transport_is_already_closed():
@@ -183,146 +161,118 @@ def test_buffered_result_is_drained_even_when_transport_is_already_closed():
         conn = Connection(ws)
     cursor = conn.cursor()
     cursor.execute("SELECT 1")
-    ws.incoming.put(
-        {
-            "kind": "execution_result",
-            "execution_id": ws.sent[0]["execution_id"],
-            "state": "succeeded",
-            "results": {"ignored": True},
-        }
-    )
+    deliver(ws, ws.sent[0]["execution_id"])
     ws.incoming.put(ConnectionClosedOK(None, None))
     ws.protocol.state = State.CLOSED
-    with patch.object(
-        conn, "_handle_results", return_value=pandas.DataFrame({"x": [1]})
-    ):
-        conn._Connection__main_loop()
-    assert cursor.fetchall()["x"].tolist() == [1]
+    conn._Connection__main_loop()
+    assert cursor._Cursor__queue.get(timeout=1).error is None
 
 
 @pytest.mark.parametrize(
-    "error", [OSError("HTTP unavailable"), ValueError("invalid JSON")]
-)
-def test_enrichment_errors_preserve_connection_failure(error):
-    ws = Transport()
-    conn = Connection(ws, failure_details=MagicMock(side_effect=error))
-    cursor = conn.cursor()
-    cursor.execute("SELECT 1")
-    ws.incoming.put(ConnectionClosedError(None, None))
-    conn._Connection__thread.join(timeout=3)
-    assert not conn._Connection__thread.is_alive()
-    with pytest.raises(OperationalError, match="Commit outcome is unknown"):
-        cursor.fetchall()
-
-
-def test_enrichment_error_is_logged_at_debug(caplog):
-    ws = Transport()
-    conn = Connection(
-        ws, failure_details=MagicMock(side_effect=ValueError("invalid JSON"))
-    )
-    cursor = conn.cursor()
-    cursor.execute("SELECT 1")
-    with caplog.at_level("DEBUG"):
-        ws.incoming.put(ConnectionClosedError(None, None))
-        conn._Connection__thread.join(timeout=3)
-    assert "Failure-details lookup failed: invalid JSON" in caplog.text
-
-
-def test_enrichment_thread_start_error_is_logged_at_debug(caplog):
-    ws = Transport()
-    conn = Connection(ws, failure_details=MagicMock(return_value="details"))
-    cursor = conn.cursor()
-    cursor.execute("SELECT 1")
-    with caplog.at_level("DEBUG"), patch(
-        "wherobots.db.connection.threading.Thread.start",
-        side_effect=RuntimeError("thread unavailable"),
-    ):
-        ws.incoming.put(ConnectionClosedError(None, None))
-        conn._Connection__thread.join(timeout=3)
-    assert "Could not start failure-details lookup: thread unavailable" in caplog.text
-
-
-@pytest.mark.parametrize(
-    "decode_error", [ValueError("malformed payload"), OSError("decoder I/O error")]
+    "decode_error", [ValueError("bad payload"), OSError("decoder error")]
 )
 def test_result_decode_error_does_not_fail_other_queries(decode_error):
-    decoded = threading.Event()
     ws = Transport()
     conn = Connection(ws)
-    bad_cursor = conn.cursor()
-    good_cursor = conn.cursor()
-    bad_cursor.execute("SELECT bad")
-    good_cursor.execute("SELECT good")
-
-    def decode(execution_id, results):
-        if execution_id == ws.sent[0]["execution_id"]:
-            decoded.set()
-            raise decode_error
-        return pandas.DataFrame({"x": [1]})
-
-    with patch.object(conn, "_handle_results", side_effect=decode):
-        for request in ws.sent:
-            ws.incoming.put(
-                {
-                    "kind": "execution_result",
-                    "execution_id": request["execution_id"],
-                    "state": "succeeded",
-                    "results": {"ignored": True},
-                }
-            )
-        assert decoded.wait(timeout=3)
-        assert good_cursor.fetchall()["x"].tolist() == [1]
-    assert conn._Connection__thread.is_alive()
+    bad = conn.cursor()
+    good = conn.cursor()
+    bad.execute("SELECT bad")
+    good.execute("SELECT good")
+    with patch.object(conn, "_handle_results", side_effect=decode_error):
+        ws.incoming.put(
+            {
+                "kind": "execution_result",
+                "execution_id": ws.sent[0]["execution_id"],
+                "state": "succeeded",
+                "results": {"ignored": True},
+            }
+        )
+        deliver(ws, ws.sent[1]["execution_id"])
+        assert good._Cursor__queue.get(timeout=3).error is None
+    assert not conn._Connection__closed
     conn.close()
-    with pytest.raises(OperationalError):
-        bad_cursor.fetchall()
-    conn._Connection__thread.join(timeout=3)
 
 
-def test_close_waits_for_registered_query_to_be_sent():
-    send_started = threading.Event()
-    release_send = threading.Event()
-    close_started = threading.Event()
-    close_finished = threading.Event()
-    events = []
+def test_serialization_error_does_not_register_or_fail_other_queries():
     ws = Transport()
-
-    def send(value):
-        send_started.set()
-        assert release_send.wait(timeout=3)
-        ws.sent.append(json.loads(value))
-        events.append("send")
-
-    def close():
-        events.append("close")
-        ws.incoming.put(ConnectionClosedOK(None, None))
-
-    ws.send = send
-    ws.close = close
     conn = Connection(ws)
-    cursor = conn.cursor()
-    execute_thread = threading.Thread(target=cursor.execute, args=("SELECT 1",))
-    execute_thread.start()
-    assert send_started.wait(timeout=3)
+    good = conn.cursor()
+    good.execute("SELECT 1")
+    store = MagicMock()
+    store.to_dict.return_value = {"invalid": object()}
+    with pytest.raises(TypeError):
+        conn.cursor().execute("SELECT 2", store=store)
+    assert len(ws.sent) == len(conn._Connection__queries) == 1
+    deliver(ws, ws.sent[0]["execution_id"])
+    assert good._Cursor__queue.get(timeout=3).error is None
+    assert not conn._Connection__closed
+    conn.close()
 
-    def close_connection():
-        close_started.set()
+
+def test_nontransport_send_error_is_propagated_and_query_is_untracked():
+    ws = Transport()
+    conn = Connection(ws)
+    good = conn.cursor()
+    good.execute("SELECT 1")
+    with patch.object(ws, "send", side_effect=ValueError("API misuse")):
+        with pytest.raises(ValueError, match="API misuse"):
+            conn.cursor().execute("SELECT 2")
+    assert len(conn._Connection__queries) == 1
+    assert not conn._Connection__closed
+    conn.close()
+
+
+@pytest.mark.parametrize("shutdown", ["close", "reader"])
+def test_stalled_send_does_not_block_result_delivery_or_shutdown(shutdown):
+    ws = Transport()
+    conn = Connection(ws)
+    a = conn.cursor()
+    b = conn.cursor()
+    a.execute("SELECT 1")
+    sending = threading.Event()
+    original_send = ws.send
+
+    def blocked_send(value):
+        sending.set()
+        # Only actual transport shutdown releases the writer, not the test.
+        assert ws.aborted.wait(timeout=3)
+        original_send(value)
+
+    ws.send = blocked_send
+    sender = threading.Thread(target=b.execute, args=("INSERT INTO t VALUES (1)",))
+    sender.start()
+    try:
+        assert sending.wait(timeout=1)
+        deliver(ws, ws.sent[0]["execution_id"])
+        assert a._Cursor__queue.get(timeout=1).error is None
+        if shutdown == "close":
+            conn.close()
+        else:
+            ws.incoming.put(ConnectionClosedError(None, None))
+        assert isinstance(b._Cursor__queue.get(timeout=2).error, OperationalError)
+        sender.join(timeout=2)
+        assert not sender.is_alive()
+        assert len(ws.sent) == 1
+        assert b._Cursor__queue.empty()
+    finally:
         conn.close()
-        close_finished.set()
+        sender.join(timeout=3)
 
-    close_thread = threading.Thread(target=close_connection)
-    close_thread.start()
-    assert close_started.wait(timeout=3)
-    assert not close_finished.is_set()
-    release_send.set()
-    execute_thread.join(timeout=3)
-    close_thread.join(timeout=3)
-    conn._Connection__thread.join(timeout=3)
-    assert not execute_thread.is_alive()
-    assert not close_thread.is_alive()
-    assert events == ["send", "close"]
-    with pytest.raises(OperationalError):
-        cursor.fetchall()
+
+def test_close_from_reader_callback_does_not_join_itself():
+    ws = Transport()
+    conn = Connection(ws)
+    finished = threading.Event()
+
+    def progress(_):
+        conn.close()
+        finished.set()
+
+    conn.set_progress_handler(progress)
+    ws.incoming.put({"kind": "execution_progress", "execution_id": "progress"})
+    assert finished.wait(timeout=2)
+    conn._Connection__thread.join(timeout=2)
+    assert not conn._Connection__thread.is_alive()
 
 
 def test_close_racing_result_decode_delivers_only_one_terminal_outcome():
@@ -335,7 +285,7 @@ def test_close_racing_result_decode_delivers_only_one_terminal_outcome():
 
     def decode(*args):
         decoding.set()
-        assert release.wait(timeout=3)
+        assert release.wait(timeout=5)
         return pandas.DataFrame({"x": [1]})
 
     with patch.object(conn, "_handle_results", side_effect=decode):
@@ -347,11 +297,127 @@ def test_close_racing_result_decode_delivers_only_one_terminal_outcome():
                 "results": {"ignored": True},
             }
         )
-        assert decoding.wait(timeout=3)
+        assert decoding.wait(timeout=2)
+        started = time.monotonic()
         conn.close()
+        assert time.monotonic() - started < 2
+        assert conn._Connection__thread.is_alive()
+        with pytest.raises(OperationalError):
+            cursor.fetchall()
         release.set()
-        conn._Connection__thread.join(timeout=3)
-    assert not conn._Connection__thread.is_alive()
-    with pytest.raises(OperationalError):
-        cursor.fetchall()
+        conn._Connection__thread.join(timeout=2)
     assert cursor._Cursor__queue.empty()
+
+
+def test_concurrent_close_delivers_once():
+    ws = Transport()
+    conn = Connection(ws)
+    cursor = conn.cursor()
+    cursor.execute("SELECT 1")
+    closers = [threading.Thread(target=conn.close) for _ in range(4)]
+    for closer in closers:
+        closer.start()
+    for closer in closers:
+        closer.join(timeout=2)
+        assert not closer.is_alive()
+    assert isinstance(cursor._Cursor__queue.get(timeout=1).error, OperationalError)
+    assert cursor._Cursor__queue.empty()
+    ws.socket.shutdown.assert_called_once()
+
+
+def test_abort_closes_socket_even_if_shutdown_errors():
+    ws = MagicMock()
+    ws.socket.shutdown.side_effect = OSError(errno.EIO, "shutdown failure")
+    with pytest.raises(OSError):
+        abort_connection(ws)
+    ws.socket.close.assert_called_once()
+
+
+def test_failure_is_not_delivered_before_transport_is_disabled():
+    ws = Transport()
+    conn = Connection(ws)
+    cursor = conn.cursor()
+    cursor.execute("SELECT 1")
+    abort_started = threading.Event()
+    release_abort = threading.Event()
+    shutdown = ws.shutdown
+
+    def delayed_abort(how):
+        abort_started.set()
+        assert release_abort.wait(timeout=3)
+        shutdown(how)
+
+    ws.socket.shutdown.side_effect = delayed_abort
+    closer = threading.Thread(target=conn.close)
+    closer.start()
+    try:
+        assert abort_started.wait(timeout=1)
+        assert cursor._Cursor__queue.empty()
+        with pytest.raises(OperationalError):
+            conn.cursor().execute("SELECT 2")
+        release_abort.set()
+        closer.join(timeout=2)
+        assert not closer.is_alive()
+        assert ws.aborted.is_set()
+        assert isinstance(cursor._Cursor__queue.get(timeout=1).error, OperationalError)
+    finally:
+        release_abort.set()
+        closer.join(timeout=3)
+
+
+def test_real_websocket_stalled_send_is_interrupted_by_close():
+    # Real library protocol mutex + socket.sendall; the peer never reads.
+    local, peer = socket.socketpair()
+    local.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
+    protocol = ClientProtocol(parse_uri("ws://localhost"), state=State.OPEN)
+    ws = ClientConnection(local, protocol)
+    conn = Connection(ws)
+    entered = threading.Event()
+    send_data = ws.send_data
+
+    def observe_send():
+        entered.set()
+        send_data()
+
+    outcomes = queue.Queue()
+    query = Query(
+        "SELECT 1", "blocked", ExecutionState.EXECUTION_REQUESTED, outcomes.put
+    )
+    with patch.object(ws, "send_data", side_effect=observe_send):
+        sender = threading.Thread(
+            target=conn._Connection__send,
+            args=(
+                {
+                    "kind": "execute_sql",
+                    "execution_id": "blocked",
+                    "statement": "x" * (8 * 1024 * 1024),
+                },
+                query,
+            ),
+        )
+        sender.start()
+        try:
+            assert entered.wait(timeout=3)
+            assert sender.is_alive()
+            conn.close()
+            assert isinstance(outcomes.get(timeout=2).error, OperationalError)
+            sender.join(timeout=3)
+            assert not sender.is_alive()
+            assert not conn._Connection__thread.is_alive()
+            ws.recv_events_thread.join(timeout=2)
+            assert not ws.recv_events_thread.is_alive()
+        finally:
+            peer.close()
+            conn.close()
+            sender.join(timeout=3)
+
+
+def test_direct_connection_uses_explicit_session_id():
+    ws = Transport()
+    with patch("wherobots.db.driver.websockets.sync.client.connect", return_value=ws):
+        conn = connect_direct("wss://compute/sql", session_id="session-1")
+    cursor = conn.cursor()
+    cursor.execute("SELECT 1")
+    conn.close()
+    with pytest.raises(OperationalError, match="session=session-1"):
+        cursor.fetchall()
