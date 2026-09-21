@@ -70,6 +70,7 @@ class Connection:
         data_compression: DataCompression | None = None,
         geometry_representation: GeometryRepresentation | None = None,
         session_id: str | None = None,
+        on_connection_lost: Callable[[], None] | None = None,
     ):
         self.__ws = ws
         self.__read_timeout = read_timeout
@@ -79,6 +80,9 @@ class Connection:
         self.__progress_handler: ProgressHandler | None = None
 
         self.__session_id = session_id
+        # Internal notification hook: schedule optional diagnostics, never wait
+        # for remote results here. All cursor failures are delivered first.
+        self.__on_connection_lost = on_connection_lost
         self.__lock = threading.Lock()
         self.__send_lock = threading.Lock()
         self.__shutdown_done = threading.Event()
@@ -103,7 +107,7 @@ class Connection:
         decoder or callback can outlive the bounded reader join.
         """
         deadline = time.monotonic() + 1.0
-        self.__fail_pending()
+        self.__fail_pending(notify=False)
         # A handler may close its own connection during terminal delivery.
         if self.__shutdown_owner == threading.get_ident():
             return
@@ -170,7 +174,7 @@ class Connection:
         )
         return OperationalError(message)
 
-    def __fail_pending(self) -> None:
+    def __fail_pending(self, notify: bool = True) -> None:
         # Stop admission first. Do not wait for __send_lock: its owner may be
         # blocked in network I/O. __closed means closing until shutdown_done.
         with self.__lock:
@@ -201,6 +205,11 @@ class Connection:
         finally:
             self.__shutdown_owner = None
             self.__shutdown_done.set()
+        if notify and pending and self.__on_connection_lost is not None:
+            try:
+                self.__on_connection_lost()
+            except Exception:
+                logging.debug("Could not schedule session diagnostics")
 
     def __listen(self) -> None:
         """Waits for the next message from the SQL session and processes it.
