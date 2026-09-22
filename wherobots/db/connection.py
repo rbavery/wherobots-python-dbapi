@@ -178,15 +178,13 @@ class Connection:
                 return
             self.__closed = True
             self.__shutdown_owner = threading.get_ident()
+        # __closed is a one-way latch: nothing below may be skipped, or pending
+        # queries are stranded with no path to recovery.
         try:
-            abort_connection(self.__ws)
-        except OSError:
-            # The adapter still closes the socket object in its finally block.
-            logging.exception("Socket shutdown failed; socket was closed")
-        with self.__lock:
-            pending = list(self.__queries.values())
-            self.__queries.clear()
-        try:
+            self.__terminate_transport()
+            with self.__lock:
+                pending = list(self.__queries.values())
+                self.__queries.clear()
             for query in pending:
                 try:
                     query.handler(
@@ -201,6 +199,14 @@ class Connection:
         finally:
             self.__shutdown_owner = None
             self.__shutdown_done.set()
+
+    def __terminate_transport(self) -> None:
+        """Disable the transport. Never raises: delivery must not be skipped."""
+        try:
+            abort_connection(self.__ws)
+        except Exception:
+            # The adapter still closes the socket object in its finally block.
+            logging.exception("Could not abort SQL session transport")
 
     def __listen(self) -> None:
         """Waits for the next message from the SQL session and processes it.

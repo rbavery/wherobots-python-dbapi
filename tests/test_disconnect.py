@@ -470,6 +470,25 @@ def test_abort_closes_socket_even_if_shutdown_errors():
     ws.socket.close.assert_called_once()
 
 
+def test_abort_failure_still_fails_pending_and_completes_shutdown():
+    # A non-OSError from the adapter (e.g. a renamed attribute in a future
+    # websockets release) must not skip delivery: __closed is a one-way latch.
+    ws = Transport()
+    conn = Connection(ws)
+    cursor = conn.cursor()
+    cursor.execute("SELECT 1")
+    ws.socket.shutdown.side_effect = AttributeError("no attribute 'socket'")
+    conn.close()
+    with pytest.raises(OperationalError):
+        cursor.fetchall()
+    assert not conn._Connection__queries
+    assert conn._Connection__shutdown_done.is_set()
+    assert conn._Connection__shutdown_owner is None
+    with pytest.raises(OperationalError):
+        conn.cursor().execute("SELECT 2")
+    conn.close()
+
+
 def test_failure_is_not_delivered_before_transport_is_disabled():
     ws = Transport()
     conn = Connection(ws)
