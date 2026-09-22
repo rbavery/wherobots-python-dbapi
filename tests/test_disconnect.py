@@ -32,6 +32,8 @@ class Transport:
         self.incoming = queue.Queue()
         self.sent = []
         self.aborted = threading.Event()
+        self.closed = threading.Event()
+        self.close_calls = 0
         self.socket = MagicMock()
         self.socket.shutdown.side_effect = self.shutdown
 
@@ -55,6 +57,13 @@ class Transport:
 
     def shutdown(self, how):
         assert how == socket.SHUT_RDWR
+        self.aborted.set()
+        self.incoming.put(ConnectionClosedOK(None, None))
+
+    def close(self):
+        # Graceful handshake: the library's close() completes and recv sees EOF.
+        self.close_calls += 1
+        self.closed.set()
         self.aborted.set()
         self.incoming.put(ConnectionClosedOK(None, None))
 
@@ -143,7 +152,67 @@ def test_close_fails_pending_and_joins_reader():
         cursor.fetchall()
     assert not conn._Connection__thread.is_alive()
     conn.close()
+    assert ws.close_calls == 1
+    ws.socket.shutdown.assert_not_called()
+
+
+def test_idle_close_performs_close_handshake():
+    ws = Transport()
+    conn = Connection(ws)
+    conn.close()
+    assert ws.close_calls == 1
+    ws.socket.shutdown.assert_not_called()
+    assert not conn._Connection__thread.is_alive()
+    assert not conn._Connection__send_lock.locked()
+
+
+def test_close_with_stalled_send_falls_back_to_abort():
+    ws = Transport()
+    conn = Connection(ws)
+    cursor = conn.cursor()
+    sending, timed_out = threading.Event(), threading.Event()
+    original_send = ws.send
+
+    def blocked_send(value):
+        sending.set()
+        # Only actual transport shutdown releases the writer. Record a timeout
+        # rather than asserting here: __send re-raises, but only the test body
+        # can report it.
+        if not ws.aborted.wait(timeout=3):
+            timed_out.set()
+        original_send(value)
+
+    ws.send = blocked_send
+    sender = threading.Thread(target=cursor.execute, args=("SELECT 1",))
+    sender.start()
+    try:
+        assert sending.wait(timeout=1)
+        conn.close()
+        ws.socket.shutdown.assert_called_once()
+        assert ws.close_calls == 0
+        assert isinstance(cursor._Cursor__queue.get(timeout=2).error, OperationalError)
+    finally:
+        conn.close()
+        sender.join(timeout=3)
+    assert not sender.is_alive()
+    assert not timed_out.is_set()
+
+
+@pytest.mark.parametrize(
+    "error", [ConnectionClosedError(None, None), OSError("transport lost")]
+)
+def test_reader_failure_aborts_without_close_handshake(error):
+    ws = Transport()
+    conn = Connection(ws)
+    cursor = conn.cursor()
+    cursor.execute("SELECT 1")
+    ws.incoming.put(error)
+    conn._Connection__thread.join(timeout=3)
+    assert not conn._Connection__thread.is_alive()
     ws.socket.shutdown.assert_called_once()
+    assert ws.close_calls == 0
+    with pytest.raises(OperationalError):
+        cursor.fetchall()
 
 
 @pytest.mark.parametrize(
@@ -459,7 +528,8 @@ def test_concurrent_close_delivers_once():
         assert not closer.is_alive()
     assert isinstance(cursor._Cursor__queue.get(timeout=1).error, OperationalError)
     assert cursor._Cursor__queue.empty()
-    ws.socket.shutdown.assert_called_once()
+    assert ws.close_calls == 1
+    ws.socket.shutdown.assert_not_called()
 
 
 def test_abort_closes_socket_even_if_shutdown_errors():
@@ -477,6 +547,7 @@ def test_abort_failure_still_fails_pending_and_completes_shutdown():
     conn = Connection(ws)
     cursor = conn.cursor()
     cursor.execute("SELECT 1")
+    ws.close = MagicMock(side_effect=AttributeError("no attribute 'close'"))
     ws.socket.shutdown.side_effect = AttributeError("no attribute 'socket'")
     conn.close()
     with pytest.raises(OperationalError):
@@ -489,36 +560,78 @@ def test_abort_failure_still_fails_pending_and_completes_shutdown():
     conn.close()
 
 
-def test_failure_is_not_delivered_before_transport_is_disabled():
+def _delayed(hook, started, release, timed_out):
+    """Wrap a teardown hook so the test controls when it completes.
+
+    Production code swallows exceptions from the transport, so an ``assert``
+    inside the hook would be invisible; record a timeout instead and let the
+    test body assert on it.
+    """
+
+    def delayed(*args):
+        started.set()
+        if not release.wait(timeout=3):
+            timed_out.set()
+        hook(*args)
+
+    return delayed
+
+
+def test_failure_is_not_delivered_before_graceful_close_completes():
     ws = Transport()
     conn = Connection(ws)
     cursor = conn.cursor()
     cursor.execute("SELECT 1")
-    abort_started = threading.Event()
-    release_abort = threading.Event()
-    shutdown = ws.shutdown
-
-    def delayed_abort(how):
-        abort_started.set()
-        assert release_abort.wait(timeout=3)
-        shutdown(how)
-
-    ws.socket.shutdown.side_effect = delayed_abort
+    started, release, timed_out = (threading.Event() for _ in range(3))
+    ws.close = _delayed(ws.close, started, release, timed_out)
     closer = threading.Thread(target=conn.close)
     closer.start()
     try:
-        assert abort_started.wait(timeout=1)
+        assert started.wait(timeout=1)
+        assert cursor._Cursor__queue.empty()
+        # Senders fail fast on the latch; they don't wait for the handshake.
+        begun = time.monotonic()
+        with pytest.raises(OperationalError):
+            conn.cursor().execute("SELECT 2")
+        assert time.monotonic() - begun < 1
+        assert cursor._Cursor__queue.empty()
+        release.set()
+        closer.join(timeout=2)
+        assert not closer.is_alive()
+        assert not timed_out.is_set()
+        assert ws.close_calls == 1
+        ws.socket.shutdown.assert_not_called()
+        assert isinstance(cursor._Cursor__queue.get(timeout=1).error, OperationalError)
+    finally:
+        release.set()
+        closer.join(timeout=3)
+
+
+def test_failure_is_not_delivered_before_transport_is_aborted():
+    ws = Transport()
+    conn = Connection(ws)
+    cursor = conn.cursor()
+    cursor.execute("SELECT 1")
+    started, release, timed_out = (threading.Event() for _ in range(3))
+    ws.socket.shutdown.side_effect = _delayed(ws.shutdown, started, release, timed_out)
+    # Reader-side failure: the abort runs on the reader thread.
+    ws.incoming.put(ConnectionClosedError(None, None))
+    try:
+        assert started.wait(timeout=1)
         assert cursor._Cursor__queue.empty()
         with pytest.raises(OperationalError):
             conn.cursor().execute("SELECT 2")
-        release_abort.set()
-        closer.join(timeout=2)
-        assert not closer.is_alive()
-        assert ws.aborted.is_set()
+        assert cursor._Cursor__queue.empty()
+        release.set()
+        conn._Connection__thread.join(timeout=2)
+        assert not conn._Connection__thread.is_alive()
+        assert not timed_out.is_set()
+        ws.socket.shutdown.assert_called_once()
+        assert ws.close_calls == 0
         assert isinstance(cursor._Cursor__queue.get(timeout=1).error, OperationalError)
     finally:
-        release_abort.set()
-        closer.join(timeout=3)
+        release.set()
+        conn.close()
 
 
 @pytest.mark.parametrize("tls", [False, True])

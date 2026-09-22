@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import requests
 
+from wherobots.db.constants import DEFAULT_CLOSE_TIMEOUT_SECONDS
 from wherobots.db.driver import (
     DEFAULT_HTTP_TIMEOUT,
     _check_cancelled,
@@ -232,6 +233,20 @@ class TestConnectDirectCancelEvent:
             )
 
         mock_ws.assert_not_called()
+
+
+class TestConnectDirectWebSocket:
+    @patch("wherobots.db.driver.websockets.sync.client.connect")
+    def test_close_handshake_is_bounded(self, mock_ws):
+        from websockets.exceptions import ConnectionClosedOK
+
+        ws = MagicMock()
+        ws.recv.side_effect = ConnectionClosedOK(None, None)
+        mock_ws.return_value = ws
+        conn = connect_direct(uri="wss://compute.example.com/sql/org/session-id")
+        conn.close()
+        _, kwargs = mock_ws.call_args
+        assert kwargs["close_timeout"] == DEFAULT_CLOSE_TIMEOUT_SECONDS
 
 
 class TestWherobotsClientHeader:

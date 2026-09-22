@@ -97,13 +97,20 @@ class Connection:
         self.close()
 
     def close(self) -> None:
-        """Abort the transport, fail pending work, and wait up to 1s for the reader.
+        """Close the transport, fail pending work, and wait up to 1s for the reader.
+
+        The WebSocket close handshake is attempted when no send is in flight,
+        so the server can distinguish a client exit from a crash; otherwise the
+        socket is aborted. The handshake is bounded by the ``close_timeout`` of
+        the underlying ``ClientConnection`` (1s via ``connect``/
+        ``connect_direct``; the library default of 10s for a caller-built
+        socket), and shares the 1s budget below with the reader join.
 
         Closing doesn't imply that server-side writes were rolled back. A
         decoder or callback can outlive the bounded reader join.
         """
         deadline = time.monotonic() + 1.0
-        self.__fail_pending()
+        self.__fail_pending(graceful=True)
         # A handler may close its own connection during terminal delivery.
         if self.__shutdown_owner == threading.get_ident():
             return
@@ -170,7 +177,7 @@ class Connection:
         )
         return OperationalError(message)
 
-    def __fail_pending(self) -> None:
+    def __fail_pending(self, graceful: bool = False) -> None:
         # Stop admission first. Do not wait for __send_lock: its owner may be
         # blocked in network I/O. __closed means closing until shutdown_done.
         with self.__lock:
@@ -181,7 +188,7 @@ class Connection:
         # __closed is a one-way latch: nothing below may be skipped, or pending
         # queries are stranded with no path to recovery.
         try:
-            self.__terminate_transport()
+            self.__terminate_transport(graceful)
             with self.__lock:
                 pending = list(self.__queries.values())
                 self.__queries.clear()
@@ -200,8 +207,25 @@ class Connection:
             self.__shutdown_owner = None
             self.__shutdown_done.set()
 
-    def __terminate_transport(self) -> None:
+    def __terminate_transport(self, graceful: bool) -> None:
         """Disable the transport. Never raises: delivery must not be skipped."""
+        # A non-blocking acquire tells us whether a sender is inside ws.send()
+        # right now, possibly stalled holding the library's protocol mutex,
+        # which close() would deadlock on. Releasing immediately is safe: the
+        # __closed latch is already set, and __send re-checks it under __lock
+        # after taking __send_lock, so no sender can reach ws.send() from here
+        # on. Holding the lock across the handshake would only park unrelated
+        # senders (including the reader's own __request_results) for up to
+        # close_timeout instead of letting them fail fast. On a reader-side
+        # failure the transport is already broken and a close frame is
+        # pointless, so callers abort directly.
+        if graceful and self.__send_lock.acquire(blocking=False):
+            self.__send_lock.release()
+            try:
+                self.__ws.close()
+                return
+            except Exception:
+                logging.debug("Graceful close failed; aborting", exc_info=True)
         try:
             abort_connection(self.__ws)
         except Exception:
